@@ -10,7 +10,8 @@
 #  The scripts refuse a config that is not owned by root or is readable /
 #  writable by group or others (it contains passwords and is sourced by bash).
 #
-#  There are no defaults: every key below must have a value. A key that is
+#  There are no defaults: every key below must have a value, except where it
+#  says "mode ... only" (leave those empty in the other mode). A key that is
 #  empty or missing stops the script before it changes anything.
 #  Values are bash assignments: KEY="value" (no spaces around '=').
 # =============================================================================
@@ -37,7 +38,7 @@ EJBCA_PATCHES_TAG="2.963.0"
 ED25519_VERSION="2.963.0"
 
 # Ubuntu packages installed from the bundle's local apt repository.
-OS_PACKAGES="openjdk-21-jdk-headless ant ant-optional mariadb-server mariadb-client unzip curl net-tools"
+OS_PACKAGES="openjdk-21-jdk-headless ant ant-optional mariadb-server mariadb-client unzip curl"
 
 # -----------------------------------------------------------------------------
 # Paths  (WildFly paths, user and service are fixed by WildFly's systemd unit;
@@ -52,7 +53,7 @@ WILDFLY_SERVICE="wildfly-standalone"
 # -----------------------------------------------------------------------------
 # Host
 # -----------------------------------------------------------------------------
-EJBCA_HOSTNAME="ca.example.org"     # CN + SAN of the TLS certificate
+EJBCA_HOSTNAME="ca.example.org"     # CN + SAN of the TLS certificate (upgrade: the 7.x hostname)
 DN_SUFFIX="O=Example,C=PT"          # appended to the ManagementCA, TLS and SuperAdmin DNs
 HTTP_PORT="8080"
 HTTPS_PORT="8443"
@@ -71,11 +72,30 @@ DB_PASS=""
 # -----------------------------------------------------------------------------
 # Encrypts sensitive values stored in the database (crypto token PINs, etc.).
 # Set it once, before the first install, and NEVER change it afterwards.
-# For a 7.x migration it must be the 7.x instance's value.
+# Mode upgrade-from-7x: the 7.x instance's value. If the 7.x
+# conf/cesecore.properties has no password.encryption.key line, write
+# "default" (EJBCA's built-in key; the line is then left out here too).
+# If the 7.x instance set password.encryption.count, stop: not supported.
 PBE_ENCRYPTION_KEY=""
-KS_PASS=""            # TLS keystore password (httpsserver.password)
-TS_PASS=""            # TLS truststore password (java.trustpassword)
-SUPERADMIN_PASS=""    # superadmin.p12 password
+# TLS keystore / truststore passwords (at least 6 characters).
+# Mode upgrade-from-7x: the passwords of the 7.x keystores below
+# (7.x conf/web.properties: httpsserver.password, java.trustpassword).
+KS_PASS=""
+TS_PASS=""
+SUPERADMIN_PASS=""    # superadmin.p12 password - mode fresh only
+
+# -----------------------------------------------------------------------------
+# Upgrade from 7.x - mode upgrade-from-7x only (leave empty for mode fresh)
+# -----------------------------------------------------------------------------
+# Taken from the 7.x instance AFTER stopping its WildFly for good:
+#   database:  mysqldump --single-transaction --routines --triggers <db> | gzip > ejbca-7x.sql.gz
+#              (no --databases option: the dump must not contain CREATE DATABASE/USE)
+#   keystores: <7.x WildFly>/standalone/configuration/keystore/keystore.jks (or .p12)
+#              and truststore.jks (or .p12)
+# The 7.x TLS certificate is reused, so EJBCA_HOSTNAME should be the 7.x hostname.
+UPGRADE_DB_DUMP=""          # e.g. /root/ejbca-7x.sql.gz (.sql or .sql.gz)
+UPGRADE_TLS_KEYSTORE=""     # e.g. /root/7x/keystore.jks
+UPGRADE_TLS_TRUSTSTORE=""   # e.g. /root/7x/truststore.jks
 
 # -----------------------------------------------------------------------------
 # HSM (Utimaco) - installed by the client before running the installer

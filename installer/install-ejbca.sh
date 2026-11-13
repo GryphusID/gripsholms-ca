@@ -12,7 +12,12 @@
 #
 #    --config FILE      ejbca-install.conf (see ejbca-install.conf.sample)   [required]
 #    --mode MODE        fresh            new host, new database, new ManagementCA
-#                       upgrade-from-7x  (not available in this release)     [required]
+#                       upgrade-from-7x  new host, database imported from a 7.x
+#                                        instance (UPGRADE_DB_DUMP), its TLS
+#                                        keystores reused; EJBCA's standard
+#                                        upgrade and post-upgrade run here.
+#                                        Then run each add-on's
+#                                        --mode migrate-from-7x.          [required]
 #    --addon NAME       add-on shipped in the EJBCA source (addons/NAME/) to
 #                       install, e.g. ed25519 (repeat for several add-ons). Its
 #                       addons/NAME/install-NAME.sh runs at the hook points.  [optional]
@@ -37,6 +42,15 @@
 #    11  Install         ant runinstall, ant deploy-keystore, reload
 #    12  Add-ons         addons/NAME/install-NAME.sh --mode verify      (with --addon)
 #    13  Finalise        ownership, service enabled, firewall, summary
+#
+#  MODE upgrade-from-7x differs in:
+#     5  Database        import UPGRADE_DB_DUMP, then the 9.6.1 column change
+#     8  EJBCA conf      no install.properties / SuperAdmin values;
+#                        password.encryption.key only if PBE_ENCRYPTION_KEY
+#                        is not "default"
+#    10  Build + deploy  first start runs EJBCA's standard upgrade (7.x -> 9.x)
+#    11  Upgrade         7.x TLS keystores, then post-upgrade (ant upgrade)
+#    12  Add-ons         skipped: verify after the add-on's migrate-from-7x
 # =============================================================================
 set -euo pipefail
 
@@ -52,9 +66,11 @@ REQUIRED_KEYS=(
     BUNDLE_DIR EJBCA_HOME WILDFLY_HOME WILDFLY_USER WILDFLY_SERVICE
     EJBCA_HOSTNAME DN_SUFFIX HTTP_PORT HTTPS_PORT HEAP_SIZE_MB
     DB_ROOT_PASS DB_NAME DB_USER DB_PASS
-    PBE_ENCRYPTION_KEY KS_PASS TS_PASS SUPERADMIN_PASS
+    PBE_ENCRYPTION_KEY KS_PASS TS_PASS
     P11_LIB_NAME P11_LIB_FILE HSM_CFG_FILE
 )
+FRESH_KEYS=(SUPERADMIN_PASS)
+UPGRADE_KEYS=(UPGRADE_DB_DUMP UPGRADE_TLS_KEYSTORE UPGRADE_TLS_TRUSTSTORE)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -78,8 +94,9 @@ load_config() {
     [[ "${perms: -2}" == "00" ]] || error "Config ${file} must not be accessible by group/others (chmod 600; is: ${perms})."
     # shellcheck disable=SC1090
     source "$file"
-    local missing=()
-    for k in "${REQUIRED_KEYS[@]}"; do
+    local missing=() keys=("${REQUIRED_KEYS[@]}")
+    if [[ "$MODE" == "fresh" ]]; then keys+=("${FRESH_KEYS[@]}"); else keys+=("${UPGRADE_KEYS[@]}"); fi
+    for k in "${keys[@]}"; do
         [[ -n "${!k:-}" ]] || missing+=("$k")
     done
     [[ ${#missing[@]} -eq 0 ]] || error "Config ${file}: missing or empty values: ${missing[*]}"
@@ -124,6 +141,69 @@ cli_reload() {
 
 mysql_root() { mysql -u root -p"${DB_ROOT_PASS}" "$@"; }
 
+is_upgrade() { [[ "$MODE" == "upgrade-from-7x" ]]; }
+
+# Value of KEY in EJBCA's UPGRADE global configuration. EJBCA stores it as a
+# serialized Java map (org.cesecore.util.Base64GetHashMap), read here with a
+# small Perl reader of the Java serialization format (strings, references,
+# objects, HashMap entries). Values may carry a "B64:" prefix.
+UPGVAL_PL='use strict; use warnings;
+my ($key, $hex) = @ARGV;
+my $d = pack("H*", $hex // ""); my $p = 0; my @h; my @pairs;
+sub rd  { my $n = shift; die "eof\n" if $p + $n > length $d; my $s = substr($d, $p, $n); $p += $n; $s }
+sub u8  { ord rd(1) }  sub u16 { unpack "n", rd(2) }  sub u32 { unpack "N", rd(4) }
+sub utf { rd(u16()) }
+sub content {
+    my $t = u8();
+    if ($t == 0x70) { return undef }                                   # TC_NULL
+    if ($t == 0x71) { return $h[u32() - 0x7E0000] }                    # TC_REFERENCE
+    if ($t == 0x74) { my $s = utf(); push @h, $s; return $s }          # TC_STRING
+    if ($t == 0x7C) { rd(4); my $s = rd(u32()); push @h, $s; return $s } # TC_LONGSTRING
+    if ($t == 0x77) { rd(u8());  return { block => 1 } }               # TC_BLOCKDATA
+    if ($t == 0x7A) { rd(u32()); return { block => 1 } }               # TC_BLOCKDATALONG
+    if ($t == 0x72) { return classdesc() }                             # TC_CLASSDESC
+    if ($t == 0x73) { return object() }                                # TC_OBJECT
+    if ($t == 0x7E) { my $c = content(); my $i = @h; push @h, undef; my $v = content(); $h[$i] = $v; return $v } # TC_ENUM
+    if ($t == 0x75) { my $c = content(); push @h, undef; my $n = u32(); fieldval(substr($c->{name}, 1, 1)) for 1..$n; return {} } # TC_ARRAY
+    die sprintf("unsupported tag 0x%02x at %d\n", $t, $p - 1);
+}
+sub classdesc {
+    my %c = (name => utf()); rd(8); push @h, \%c;
+    $c{flags} = u8(); my $n = u16(); $c{fields} = [];
+    for (1..$n) { my $tc = chr u8(); my $fn = utf(); content() if $tc eq "L" || $tc eq "["; push @{$c{fields}}, $tc }
+    1 while defined(annot());                                          # classAnnotation
+    $c{super} = content();
+    return \%c;
+}
+sub annot { return undef if substr($d, $p, 1) eq "\x78" && ++$p; return [content()] }
+my %size = (B=>1, C=>2, D=>8, F=>4, I=>4, J=>8, S=>2, Z=>1);
+sub fieldval { my $tc = shift; return content() if $tc eq "L" || $tc eq "["; rd($size{$tc}); undef }
+sub object {
+    my $c = content(); push @h, { obj => 1 };
+    my @chain; for (my $x = $c; ref $x eq "HASH" && $x->{name}; $x = $x->{super}) { unshift @chain, $x }
+    for my $cd (@chain) {
+        fieldval($_) for @{$cd->{fields}};
+        next unless $cd->{flags} & 0x01;                               # SC_WRITE_METHOD
+        my @items; while (defined(my $a = annot())) { push @items, $a->[0] }
+        if ($cd->{name} eq "java.util.HashMap") {                      # keys/values after the block data
+            my @kv = grep { !(ref $_ eq "HASH" && $_->{block}) } @items;
+            push @pairs, [splice(@kv, 0, 2)] while @kv >= 2;
+        }
+    }
+    return $h[-1];
+}
+eval { die "no stream\n" unless rd(2) eq "\xAC\xED"; rd(2); content(); 1 } or exit 1;
+for (@pairs) { if (defined $_->[0] && !ref $_->[0] && $_->[0] eq $key && defined $_->[1] && !ref $_->[1]) { print "$_->[1]\n"; exit 0 } }
+exit 1'
+upgrade_value() {
+    local key="$1" hex val
+    hex="$(mysql_root -N -B "${DB_NAME}" -e "SELECT HEX(data) FROM GlobalConfigurationData WHERE configurationId='UPGRADE'" 2>/dev/null)" || return 1
+    [[ -n "$hex" ]] || return 1
+    val="$(perl -e "$UPGVAL_PL" "$key" "$hex")" || return 1
+    [[ "$val" == B64:* ]] && val="$(printf '%s' "${val#B64:}" | base64 -d 2>/dev/null || true)"
+    printf '%s\n' "$val"
+}
+
 # ---------------------------------------------------------------------------
 # Arguments
 # ---------------------------------------------------------------------------
@@ -143,8 +223,7 @@ parse_args() {
     [[ -n "$CONFIG" ]] || error "--config is required (see --help)."
     [[ -n "$MODE"   ]] || error "--mode is required (see --help)."
     case "$MODE" in
-        fresh) ;;
-        upgrade-from-7x) error "Mode upgrade-from-7x is not available in this release." ;;
+        fresh|upgrade-from-7x) ;;
         *) error "Unknown mode: ${MODE} (fresh | upgrade-from-7x)" ;;
     esac
     CONFIG="$(readlink -f "$CONFIG")"
@@ -171,6 +250,19 @@ phase1_plan() {
         [[ ${#v} -ge 6 ]] || error "${k} must be at least 6 characters (keytool requirement)."
     done
 
+    # PBE_ENCRYPTION_KEY="default" means: leave password.encryption.key out of
+    # cesecore.properties (EJBCA's built-in key). Only valid for an upgrade whose
+    # 7.x instance never set it; a new installation must use its own key.
+    if is_upgrade; then
+        local f
+        for f in "${UPGRADE_DB_DUMP}" "${UPGRADE_TLS_KEYSTORE}" "${UPGRADE_TLS_TRUSTSTORE}"; do
+            [[ -r "$f" ]] || error "Upgrade file not found or not readable: ${f}"
+        done
+    else
+        [[ "${PBE_ENCRYPTION_KEY}" != "default" ]] \
+            || error "PBE_ENCRYPTION_KEY=\"default\" is only for upgrade-from-7x. A new installation needs its own key."
+    fi
+
     # Tag scheme <generation>.<ejbca-code>.<patch>: 2.963.0 belongs to EJBCA 9.6.3.
     local tag_code="${EJBCA_PATCHES_TAG#v}"; tag_code="${tag_code#*.}"; tag_code="${tag_code%%.*}"
     [[ "$tag_code" == "${EJBCA_VERSION//./}" ]] \
@@ -194,6 +286,17 @@ phase1_plan() {
     printf "  %-22s %s\n" "MariaDB JDBC:"  "${MARIADB_JDBC_VERSION}"
     printf "  %-22s %s\n" "EJBCA source:"  "tag ${EJBCA_PATCHES_TAG} (EJBCA ${EJBCA_VERSION}) -> ${EJBCA_HOME}"
     printf "  %-22s %s\n" "Database:"      "${DB_NAME} (user ${DB_USER}) - must not exist yet"
+    if is_upgrade; then
+        printf "  %-22s %s\n" "7.x database dump:" "${UPGRADE_DB_DUMP} -> imported into ${DB_NAME}"
+        printf "  %-22s %s\n" "7.x TLS keystores:" "${UPGRADE_TLS_KEYSTORE}, ${UPGRADE_TLS_TRUSTSTORE}"
+        if [[ "${PBE_ENCRYPTION_KEY}" == "default" ]]; then
+            printf "  %-22s %s\n" "Encryption key:" "EJBCA default (password.encryption.key not set, as on 7.x)"
+        else
+            printf "  %-22s %s\n" "Encryption key:" "PBE_ENCRYPTION_KEY (must be the 7.x instance's value)"
+        fi
+        printf "  %-22s %s\n" "Not created:"   "ManagementCA, SuperAdmin, TLS certificate (they come from 7.x)"
+        printf "  %-22s %s\n" "First start:"   "EJBCA standard upgrade 7.x -> ${EJBCA_VERSION}, then post-upgrade"
+    fi
     printf "  %-22s %s\n" "Hostname:"      "${EJBCA_HOSTNAME}"
     printf "  %-22s %s\n" "Ports:"         "HTTP ${HTTP_PORT} / HTTPS ${HTTPS_PORT}"
     printf "  %-22s %s\n" "HSM library:"   "${P11_LIB_FILE}"
@@ -207,6 +310,13 @@ phase1_plan() {
         printf "  %-22s %s\n" "Add-ons:" "(none)"
     fi
     echo -e "${BOLD}======================================================${NC}"
+    if is_upgrade; then
+        echo ""
+        warn "The 7.x instance must be STOPPED for good before this runs: both use the same"
+        warn "HSM keys, and two instances signing with them create duplicate serials/CRLs."
+        warn "This host must reach the HSM (HSM_CFG_FILE). After post-upgrade, the imported"
+        warn "database can only be used by EJBCA ${EJBCA_VERSION}; the 7.x database is not touched."
+    fi
     echo ""
     if ! $ASSUME_YES; then
         read -r -p "Proceed with this plan? [y/N] " ans
@@ -267,6 +377,14 @@ phase4_packages() {
     export JAVA_HOME
     info "Java: $(java -version 2>&1 | head -1) at ${JAVA_HOME}."
     info "Ant:  $(ant -version 2>&1 | head -1)."
+
+    if is_upgrade; then
+        keytool -list -keystore "${UPGRADE_TLS_KEYSTORE}" -storepass "${KS_PASS}" >/dev/null 2>&1 \
+            || error "Cannot open ${UPGRADE_TLS_KEYSTORE} with KS_PASS (it must be the 7.x keystore password)."
+        keytool -list -keystore "${UPGRADE_TLS_TRUSTSTORE}" -storepass "${TS_PASS}" >/dev/null 2>&1 \
+            || error "Cannot open ${UPGRADE_TLS_TRUSTSTORE} with TS_PASS (it must be the 7.x truststore password)."
+        info "7.x TLS keystore: $(keytool -list -v -keystore "${UPGRADE_TLS_KEYSTORE}" -storepass "${KS_PASS}" 2>/dev/null | grep -m1 '^Owner:' || echo '?')"
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -299,6 +417,30 @@ GRANT ALL PRIVILEGES ON ${DB_NAME}.* TO '${DB_USER}'@'localhost';
 FLUSH PRIVILEGES;
 SQL
     info "Database '${DB_NAME}' and user '${DB_USER}' ready."
+
+    if is_upgrade; then
+        local cat_cmd=(cat)
+        [[ "${UPGRADE_DB_DUMP}" == *.gz ]] && cat_cmd=(zcat)
+        local dbstmts
+        dbstmts=$("${cat_cmd[@]}" "${UPGRADE_DB_DUMP}" | grep -ciE '^(CREATE DATABASE|USE )' || true)
+        if [[ "${dbstmts:-0}" -gt 0 ]]; then
+            error "${UPGRADE_DB_DUMP} contains CREATE DATABASE/USE statements. Dump the 7.x database without --databases: mysqldump --single-transaction --routines --triggers <db> | gzip > dump.sql.gz"
+        fi
+        info "Importing ${UPGRADE_DB_DUMP} into ${DB_NAME}..."
+        "${cat_cmd[@]}" "${UPGRADE_DB_DUMP}" | mysql_root "${DB_NAME}" || error "Import of ${UPGRADE_DB_DUMP} failed."
+        local cas from
+        cas=$(mysql_root -sN "${DB_NAME}" -e "SELECT COUNT(*) FROM CAData;" 2>/dev/null || echo 0)
+        [[ "$cas" -ge 1 ]] || error "The imported database has no CAData rows - not an EJBCA database?"
+        from="$(upgrade_value upgradedToVersion || true)"
+        [[ "$from" == 7.* ]] || error "The imported database is EJBCA '${from:-unknown}', not 7.x."
+        # EJBCA 9.6.1 enlarged subjectAltName; Hibernate adds new columns itself but never resizes them.
+        mysql_root "${DB_NAME}" <<SQL || error "subjectAltName column update failed."
+ALTER TABLE IF EXISTS UserData MODIFY subjectAltName VARCHAR(8000) BINARY;
+ALTER TABLE IF EXISTS CertificateData MODIFY subjectAltName VARCHAR(8000) BINARY;
+ALTER TABLE IF EXISTS NoConflictCertificateData MODIFY subjectAltName VARCHAR(8000) BINARY;
+SQL
+        info "7.x database imported (EJBCA ${from}, ${cas} CA(s)); 9.6.1 column change applied."
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -325,19 +467,21 @@ if [ "x\$JBOSS_MODULES_SYSTEM_PKGS" = "x" ]; then
      JBOSS_MODULES_SYSTEM_PKGS="org.jboss.byteman"
 fi
 
-if [ "x\$JAVA_OPTS" = "x" ]; then
-     JAVA_OPTS="-Xms${HEAP_SIZE_MB}m -Xmx${HEAP_SIZE_MB}m"
-     JAVA_OPTS="\$JAVA_OPTS -Dhttps.protocols=TLSv1.2,TLSv1.3"
-     JAVA_OPTS="\$JAVA_OPTS -Djdk.tls.client.protocols=TLSv1.2,TLSv1.3"
-     JAVA_OPTS="\$JAVA_OPTS -Djava.net.preferIPv4Stack=true"
-     JAVA_OPTS="\$JAVA_OPTS -Djboss.modules.system.pkgs=\$JBOSS_MODULES_SYSTEM_PKGS"
-     JAVA_OPTS="\$JAVA_OPTS -Djava.awt.headless=true"
-     JAVA_OPTS="\$JAVA_OPTS -Djboss.tx.node.id=${tx_node_id}"
-     JAVA_OPTS="\$JAVA_OPTS -XX:+HeapDumpOnOutOfMemoryError"
-     JAVA_OPTS="\$JAVA_OPTS -Djdk.tls.ephemeralDHKeySize=2048"
-else
-     echo "JAVA_OPTS already set in environment; using: \$JAVA_OPTS"
-fi
+# Appended unconditionally: WildFly's systemd launcher already puts options
+# (e.g. -Djdk.serialFilter) into JAVA_OPTS before this file is read, so an
+# "only if empty" block would be skipped and the JVM would run on default heap.
+JAVA_OPTS="\$JAVA_OPTS -Xms${HEAP_SIZE_MB}m -Xmx${HEAP_SIZE_MB}m"
+JAVA_OPTS="\$JAVA_OPTS -Dhttps.protocols=TLSv1.2,TLSv1.3"
+JAVA_OPTS="\$JAVA_OPTS -Djdk.tls.client.protocols=TLSv1.2,TLSv1.3"
+JAVA_OPTS="\$JAVA_OPTS -Djava.net.preferIPv4Stack=true"
+JAVA_OPTS="\$JAVA_OPTS -Djboss.modules.system.pkgs=\$JBOSS_MODULES_SYSTEM_PKGS"
+JAVA_OPTS="\$JAVA_OPTS -Djava.awt.headless=true"
+JAVA_OPTS="\$JAVA_OPTS -Djboss.tx.node.id=${tx_node_id}"
+JAVA_OPTS="\$JAVA_OPTS -XX:+HeapDumpOnOutOfMemoryError"
+JAVA_OPTS="\$JAVA_OPTS -Djdk.tls.ephemeralDHKeySize=2048"
+# The first EJBCA deployment (and a 7.x database upgrade) can take minutes;
+# WildFly rolls the deployment back after 300 s by default.
+JAVA_OPTS="\$JAVA_OPTS -Djboss.as.management.blocking.timeout=900"
 
 # PKCS#11 (SunPKCS11 internals) access for EJBCA and the HSM add-ons on Java 17+.
 JAVA_OPTS="\$JAVA_OPTS --add-exports=jdk.crypto.cryptoki/sun.security.pkcs11.wrapper=ALL-UNNAMED"
@@ -558,9 +702,15 @@ EOF
     cat >> "${conf}/cesecore.properties" <<EOF
 
 # --- Added by install-ejbca.sh ---
+EOF
+    if [[ "${PBE_ENCRYPTION_KEY}" == "default" ]]; then
+        echo "# password.encryption.key not set: EJBCA default, as on the 7.x instance." >> "${conf}/cesecore.properties"
+    else
+        cat >> "${conf}/cesecore.properties" <<EOF
 # Must stay the same for the whole life of this instance (and its backups).
 password.encryption.key=${PBE_ENCRYPTION_KEY}
 EOF
+    fi
 
     cp "${conf}/web.properties.sample" "${conf}/web.properties"
     cat >> "${conf}/web.properties" <<EOF
@@ -572,19 +722,24 @@ httpsserver.an=dnsName=${EJBCA_HOSTNAME}
 httpsserver.password=${KS_PASS}
 httpsserver.tokentype=P12
 java.trustpassword=${TS_PASS}
-superadmin.password=${SUPERADMIN_PASS}
-superadmin.cn=SuperAdmin
-superadmin.dn=CN=SuperAdmin,${DN_SUFFIX}
-superadmin.batch=true
 httpserver.pubhttp=${HTTP_PORT}
 httpserver.privhttps=${HTTPS_PORT}
 httpserver.pubhttps=${HTTPS_PORT}
 cryptotoken.p11.lib.1.name=${P11_LIB_NAME}
 cryptotoken.p11.lib.1.file=${P11_LIB_FILE}
 EOF
+    if ! is_upgrade; then
+        cat >> "${conf}/web.properties" <<EOF
+superadmin.password=${SUPERADMIN_PASS}
+superadmin.cn=SuperAdmin
+superadmin.dn=CN=SuperAdmin,${DN_SUFFIX}
+superadmin.batch=true
+EOF
+    fi
 
-    cp "${conf}/install.properties.sample" "${conf}/install.properties"
-    cat >> "${conf}/install.properties" <<EOF
+    if ! is_upgrade; then
+        cp "${conf}/install.properties.sample" "${conf}/install.properties"
+        cat >> "${conf}/install.properties" <<EOF
 
 # --- Added by install-ejbca.sh ---
 ca.name=ManagementCA
@@ -598,6 +753,7 @@ ca.tokenpassword=null
 ca.policy=null
 ca.certificateprofile=ROOTCA
 EOF
+    fi
 
     cp "${conf}/ejbca.properties.sample" "${conf}/ejbca.properties"
     cat >> "${conf}/ejbca.properties" <<EOF
@@ -638,7 +794,29 @@ phase10_build_deploy() {
     section "=== Phase 10: Building and deploying EJBCA ==="
     export APPSRV_HOME="${WILDFLY_HOME}"
     export JAVA_HOME
+    local stamp; stamp="$(mktemp)"
     ( cd "${EJBCA_HOME}" && ant -q clean deployear ) || error "ant clean deployear failed."
+
+    if is_upgrade; then
+        # The CA tokens are offline until the add-on migration, so the health
+        # check is not ALLOK yet: wait for the deployment marker instead.
+        local dep="${WILDFLY_HOME}/standalone/deployments" w=0
+        info "Waiting for the deployment; EJBCA upgrades the 7.x database on this first start..."
+        until [[ "${dep}/ejbca.ear.deployed" -nt "$stamp" ]]; do
+            [[ -f "${dep}/ejbca.ear.failed" ]] && \
+                error "EJBCA deployment failed:\n$(head -c 2000 "${dep}/ejbca.ear.failed")\nCheck: ${WILDFLY_HOME}/standalone/log/server.log"
+            sleep 5; w=$((w+5))
+            [[ $w -ge 960 ]] && error "ejbca.ear not deployed after ${w}s. Check: ${WILDFLY_HOME}/standalone/log/server.log"
+            [[ $((w % 30)) -eq 0 ]] && info "  Still deploying... (${w}s)"
+        done
+        rm -f "$stamp"
+        local to; to="$(upgrade_value upgradedToVersion || true)"
+        [[ "$to" == "${EJBCA_VERSION}" ]] \
+            || error "EJBCA deployed but the database reports version '${to}', not ${EJBCA_VERSION}. Check server.log for 'Starting upgrade'."
+        info "EJBCA deployed; database upgraded to ${to}."
+        return 0
+    fi
+    rm -f "$stamp"
 
     # ALLOK alone is not enough: during redeploy the old instance may still answer.
     # Wait for the endpoint to go down, then up, then for the EJBCA tables.
@@ -685,8 +863,37 @@ phase11_runinstall() {
     info "TLS keystores deployed."
 }
 
+phase11_upgrade() {
+    section "=== Phase 11: 7.x TLS keystores and post-upgrade ==="
+    export APPSRV_HOME="${WILDFLY_HOME}"
+    export JAVA_HOME
+    local ksdir="${WILDFLY_HOME}/standalone/configuration/keystore"
+    keytool -importkeystore -noprompt \
+        -srckeystore "${UPGRADE_TLS_KEYSTORE}" -srcstorepass "${KS_PASS}" \
+        -destkeystore "${ksdir}/keystore.p12" -deststoretype PKCS12 -deststorepass "${KS_PASS}" >/dev/null \
+        || error "Could not copy ${UPGRADE_TLS_KEYSTORE} to ${ksdir}/keystore.p12."
+    keytool -importkeystore -noprompt \
+        -srckeystore "${UPGRADE_TLS_TRUSTSTORE}" -srcstorepass "${TS_PASS}" \
+        -destkeystore "${ksdir}/truststore.p12" -deststoretype PKCS12 -deststorepass "${TS_PASS}" >/dev/null \
+        || error "Could not copy ${UPGRADE_TLS_TRUSTSTORE} to ${ksdir}/truststore.p12."
+    chown "${WILDFLY_USER}:${WILDFLY_USER}" "${ksdir}/"*.p12
+    chmod 600 "${ksdir}/"*.p12
+    cli_reload
+    info "7.x TLS keystore and truststore in use."
+
+    ( cd "${EJBCA_HOME}" && ant upgrade ) || error "ant upgrade (post-upgrade) failed. See ${WILDFLY_HOME}/standalone/log/server.log"
+    local post; post="$(upgrade_value postUpgradedToVersion || true)"
+    [[ "${post%%.*}" == "${EJBCA_VERSION%%.*}" ]] \
+        || error "Post-upgrade did not complete (postUpgradedToVersion: '${post}'). Check Admin UI > System Upgrade."
+    info "Post-upgrade complete (${post})."
+}
+
 phase12_addons_verify() {
     section "=== Phase 12: Add-ons - verify ==="
+    if is_upgrade; then
+        info "Skipped: the add-on check needs the migrated crypto tokens (see the next steps below)."
+        return 0
+    fi
     run_addons verify
 }
 
@@ -709,14 +916,24 @@ phase13_finalise() {
 
     echo ""
     echo -e "${BOLD}${GREEN}======================================================${NC}"
-    echo -e "${BOLD}${GREEN}  EJBCA ${EJBCA_VERSION} (${EJBCA_PATCHES_TAG}) - installation complete${NC}"
+    echo -e "${BOLD}${GREEN}  EJBCA ${EJBCA_VERSION} (${EJBCA_PATCHES_TAG}) - $(is_upgrade && echo "upgrade from 7.x complete" || echo "installation complete")${NC}"
     echo -e "${BOLD}${GREEN}======================================================${NC}"
-    printf "  %-20s %s\n" "SuperAdmin P12:" "${EJBCA_HOME}/p12/superadmin.p12"
     printf "  %-20s %s\n" "Admin UI:"       "https://${EJBCA_HOSTNAME}:${HTTPS_PORT}/ejbca/adminweb/"
     printf "  %-20s %s\n" "WildFly log:"    "${WILDFLY_HOME}/standalone/log/server.log"
     echo ""
-    echo "  Next: copy superadmin.p12 to your workstation and import it in the browser"
-    echo "        (password: SUPERADMIN_PASS from the config file)."
+    if is_upgrade; then
+        echo "  Log in with the 7.x SuperAdmin certificate (its P12 from the 7.x instance)."
+        echo "  Next, for each add-on (crypto tokens are offline until then):"
+        local a
+        for a in "${ADDONS[@]}"; do
+            echo "    $(addon_installer "$a") --config ${CONFIG} --mode migrate-from-7x [--set-pins]"
+            echo "    $(addon_installer "$a") --config ${CONFIG} --mode verify"
+        done
+    else
+        printf "  %-20s %s\n" "SuperAdmin P12:" "${EJBCA_HOME}/p12/superadmin.p12"
+        echo "  Next: copy superadmin.p12 to your workstation and import it in the browser"
+        echo "        (password: SUPERADMIN_PASS from the config file)."
+    fi
     echo -e "${BOLD}${GREEN}======================================================${NC}"
 }
 
@@ -736,7 +953,7 @@ main() {
     phase8_ejbca_conf
     phase9_addons_predeploy
     phase10_build_deploy
-    phase11_runinstall
+    if is_upgrade; then phase11_upgrade; else phase11_runinstall; fi
     phase12_addons_verify
     phase13_finalise
 }

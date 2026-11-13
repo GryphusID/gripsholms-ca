@@ -14,15 +14,16 @@ You can install in two ways:
 - **[Automatic](#automatic-installation)**: two scripts do everything, driven by one config file.
 - **[Manual](#manual-installation)**: Keyfactor's standard installation, plus a few extra steps.
 
-Both give the same result.
+Both give the same result. To move an existing EJBCA 7.x instance to this version, see
+[Upgrade from EJBCA 7.x](#upgrade-from-ejbca-7x).
 
 ## Requirements
 
-- Ubuntu 22.04 LTS (x86_64), root access.
+- Ubuntu 22.04 LTS (x86_64), root access, at least 4 GB RAM and 2 CPUs.
 - The Utimaco PKCS#11 R3 library (`libcs_pkcs11_R3.so`) and its configuration file
   (`cs_pkcs11_R3.cfg`) installed and working. Both must be readable by the user that
   runs WildFly, and the `Logpath` in the configuration must be writable by it.
-- A release tag of this repository, e.g. `2.963.2`. Tags follow
+- A release tag of this repository, e.g. `2.963.1`. Tags follow
   `<generation>.<ejbca-code>.<patch>`: the middle number is the EJBCA version without
   dots, so `2.963.x` is EJBCA 9.6.3.
 
@@ -52,12 +53,13 @@ scripts before they change anything. The keys specific to this installation:
 | Key | Value |
 |-----|-------|
 | `EJBCA_REPO` | This repository, as `owner/name` |
-| `EJBCA_PATCHES_TAG` | The tag to install, e.g. `2.963.2` |
+| `EJBCA_PATCHES_TAG` | The tag to install, e.g. `2.963.1` |
 | `EJBCA_VERSION` | The EJBCA version of that tag, e.g. `9.6.3` |
 | `ED25519_VERSION` | The add-on release in that tag (`addons/ed25519/VERSION`) |
 | `P11_LIB_FILE` | Path of `libcs_pkcs11_R3.so` |
 | `HSM_CFG_FILE` | Path of `cs_pkcs11_R3.cfg` |
 | `PBE_ENCRYPTION_KEY` | Key that encrypts secrets in the database. Choose it once and never change it. |
+| `KS_PASS`, `TS_PASS` | TLS keystore and truststore passwords, at least 6 characters |
 
 The other keys are the usual installation values: hostname, ports, database
 credentials, keystore and SuperAdmin passwords.
@@ -110,11 +112,19 @@ and changes for this installation, in the order they fit into that guide.
 
 ### Step 1: WildFly service environment (when configuring WildFly)
 
-Add to WildFly's JVM options (`bin/standalone.conf`), needed for PKCS#11 on Java 17+:
+Add to WildFly's JVM options (`bin/standalone.conf`), at the end of the file so they
+always apply:
 
 ```
+# PKCS#11 on Java 17+
 JAVA_OPTS="$JAVA_OPTS --add-exports=jdk.crypto.cryptoki/sun.security.pkcs11.wrapper=ALL-UNNAMED"
+# The first EJBCA deployment can exceed WildFly's default 300 s and would be rolled back
+JAVA_OPTS="$JAVA_OPTS -Djboss.as.management.blocking.timeout=900"
 ```
+
+Check that the heap settings from Keyfactor's guide are really applied
+(`ps -o args= -C java | grep -o -- '-Xm[sx][^ ]*'`): the default `standalone.conf`
+only sets them when `JAVA_OPTS` is empty.
 
 Tell the Utimaco library where its configuration is. With the systemd service, add
 to `/etc/sysconfig/wildfly-standalone.conf`:
@@ -221,6 +231,87 @@ Or check by hand:
 - `grep HsmEd25519StartupBean $WILDFLY_HOME/standalone/log/server.log` shows `registration: true`.
 - `unzip -l /opt/ejbca/dist/ejbca.ear | grep hsm-ed25519-listener.jar` shows it at the root and under `lib/`.
 - In the Admin UI, an Ed25519 HSM crypto token can be created and an Ed25519 key generated.
+
+---
+
+## Upgrade from EJBCA 7.x
+
+The 7.x instance's database and TLS keystores are moved to a **new server**, which runs
+EJBCA's standard upgrade. The 7.x server is not changed, so it stays available as a
+fallback. Then the add-on converts the 7.x HSM crypto tokens, which EJBCA CE 9.x can no
+longer load as they are.
+
+### 1. On the 7.x server
+
+1. Note the values the new server needs:
+   ```bash
+   grep -E '^(password\.encryption\.(key|count)|httpsserver\.password|java\.trustpassword)=' \
+     <7.x EJBCA>/conf/*.properties
+   ```
+   If `password.encryption.count` is set, stop: that case is not supported.
+2. **Stop WildFly for good.** Both servers use the same HSM keys; they must never run
+   at the same time.
+3. Dump the database (without `--databases`) and copy the TLS keystores:
+   ```bash
+   sudo mysqldump --single-transaction --routines --triggers ejbca | gzip > ejbca-7x.sql.gz
+   ls <7.x WildFly>/standalone/configuration/keystore/   # keystore.jks/.p12, truststore.jks/.p12
+   ```
+4. Keep the 7.x `superadmin.p12`: you log in to the new server with it.
+
+Copy the dump and the two keystores to the new server (e.g. to `/root/`).
+
+### 2. Configuration
+
+Use the same configuration file as for a new installation, with these values:
+
+| Key | Value |
+|-----|-------|
+| `PBE_ENCRYPTION_KEY` | The 7.x `password.encryption.key`, or `default` if 7.x has none |
+| `KS_PASS`, `TS_PASS` | The 7.x `httpsserver.password` and `java.trustpassword` |
+| `EJBCA_HOSTNAME` | The 7.x hostname (its TLS certificate is reused) |
+| `UPGRADE_DB_DUMP` | The dump, e.g. `/root/ejbca-7x.sql.gz` |
+| `UPGRADE_TLS_KEYSTORE`, `UPGRADE_TLS_TRUSTSTORE` | The two 7.x keystores |
+| `SUPERADMIN_PASS` | Leave empty (not used) |
+
+The new server must reach the HSM, with the same slots and PINs as the 7.x server.
+
+### 3. Upgrade
+
+```bash
+./fetch-bundle.sh --config /root/ejbca-install.conf --out /opt/ejbca-bundle
+cd /opt/ejbca-bundle
+./install-ejbca.sh --config /root/ejbca-install.conf --mode upgrade-from-7x --addon ed25519
+```
+
+This installs everything as for a new installation, but imports the 7.x database instead
+of creating a ManagementCA and SuperAdmin. On its first start, EJBCA upgrades the
+database; the script then installs the 7.x TLS keystores and runs EJBCA's post-upgrade.
+
+### 4. Convert the HSM crypto tokens
+
+```bash
+/opt/ejbca/addons/ed25519/install-ed25519.sh --config /root/ejbca-install.conf --mode migrate-from-7x --set-pins
+```
+
+Every 7.x PKCS#11 crypto token becomes an *Ed25519 HSM* token with the R3 library; its
+slot, keys and CAs stay the same. The script restarts WildFly, then asks for each token's
+HSM PIN and tests every key. A backup of the token table is written to `/root/` first.
+
+Without `--set-pins`, it only converts the tokens: then activate each one once in the
+Admin UI (*Crypto Tokens → Activate*). Either way, this is needed once: EJBCA then stores
+the PIN again and the token comes up active on every restart.
+
+### 5. Verify
+
+```bash
+/opt/ejbca/addons/ed25519/install-ed25519.sh --config /root/ejbca-install.conf --mode verify
+```
+
+Log in with the 7.x `superadmin.p12`, check that the CAs are active, and issue a test
+certificate and CRL from a CA on the HSM.
+
+**Fallback:** until the new server issues certificates or CRLs, you can stop it and start
+the 7.x server again. After that, the 7.x database lacks what the new server issued.
 
 ---
 
