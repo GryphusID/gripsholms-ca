@@ -37,6 +37,8 @@ import org.bouncycastle.asn1.x509.Time;
 import org.bouncycastle.asn1.x509.V3TBSCertificateGenerator;
 import org.bouncycastle.asn1.x509.X509ObjectIdentifiers;
 import org.bouncycastle.crypto.digests.SHA1Digest;
+import org.bouncycastle.crypto.params.Ed25519PublicKeyParameters;
+import org.bouncycastle.crypto.signers.Ed25519Signer;
 import org.pkcs11.jacknji11.C;
 import org.pkcs11.jacknji11.CKA;
 import org.pkcs11.jacknji11.CKC;
@@ -52,6 +54,16 @@ import org.pkcs11.jacknji11.LongRef;
 public class Ed25519 {
 
     private final static Logger log = Logger.getLogger(Ed25519.class);
+
+    /**
+     * jacknji11's C class returns the PKCS#11 return code instead of throwing an exception.
+     * Turns any return code other than CKR_OK into a CKRException so that failures are not ignored.
+     */
+    private static void check(final long rv, final String operation) {
+        if (rv != CKR.OK) {
+            throw new CKRException(operation + " returned " + CKR.L2S(rv), rv);
+        }
+    }
 
     // Holds HSM information (sessions, shared libraries, Token names, Name of the provider is used as key)
     private static HashMap<String,HsmInformation> hsmInfoCache = new HashMap<String,HsmInformation>();
@@ -278,52 +290,78 @@ public class Ed25519 {
      * @return true if signature verification succeeds, false otherwise
      */
     public boolean validate_alias(String alias, String providerName) {
-
-        byte[] data = "Example data for signature validation".getBytes(StandardCharsets.UTF_8);
-        LongRef sessionRef = null;
-
+        final byte[] data = "Example data for signature validation".getBytes(StandardCharsets.UTF_8);
         try {
-            HsmInformation hsmInfo = hsmInfoCache.get(providerName);
-            sessionRef = hsmInfo.getSession();
-
-            LongRef privateKey = getPrivateKeyRef(alias, hsmInfo);
-            LongRef publicKey = getPublicKeyRef(alias, hsmInfo);
-
-            // Sign with Ed25519
-            C.SignInit(sessionRef.value(), new CKM(CKM.EDDSA), privateKey.value());
-            LongRef length = new LongRef();
-            C.Sign(sessionRef.value(), data, null, length);
-            byte[] signature = new byte[(int) length.value()];
-            C.Sign(sessionRef.value(), data, signature, length);
-
-            // Verify with public key
-            C.VerifyInit(sessionRef.value(), new CKM(CKM.EDDSA), publicKey.value());
-            C.Verify(sessionRef.value(), data, signature);
-
-            log.info("Signature verified successfully for alias: " + alias);
-            return true;
-
-        } catch (CKRException e) {
-            if (e.getCKR() == CKR.SIGNATURE_INVALID) {
-                log.warn("Signature verification failed (invalid signature) for alias: " + alias);
-            } else {
-                log.error("HSM PKCS#11 error during sign/verify for alias: " + alias, e);
+            final HsmInformation hsmInfo = hsmInfoCache.get(providerName);
+            if (hsmInfo == null) {
+                log.warn("HSM provider not initialized, cannot validate alias: " + alias);
+                return false;
+            }
+            // Sign through the same code path, cached key handles and mechanism as certificate and CRL signing,
+            // so the health check fails whenever production signing would fail.
+            final byte[] signature = sign(alias, data, providerName);
+            final byte[] publicKey = getPublicKeyValue(alias, hsmInfo);
+            final Ed25519Signer verifier = new Ed25519Signer();
+            verifier.init(false, new Ed25519PublicKeyParameters(publicKey, 0));
+            verifier.update(data, 0, data.length);
+            if (verifier.verifySignature(signature)) {
+                if (log.isDebugEnabled()) {
+                    log.debug("Signature verified successfully for alias: " + alias);
+                }
+                return true;
+            }
+            log.warn("Signature made by the HSM with alias " + alias + " does not verify with its public key.");
+            return false;
+        } catch (RuntimeException e) {
+            log.warn("HSM signature test failed for alias: " + alias + ": " + e.getMessage());
+            if (log.isDebugEnabled()) {
+                log.debug("HSM signature test failure details", e);
             }
             return false;
+        }
+    }
 
-        } catch (Exception e) {
-            log.error("Unexpected error during validation for alias: " + alias, e);
-            return false;
+    /** Reads the raw 32-byte Ed25519 public key (CKA_VALUE) of an alias from the HSM. */
+    private static byte[] getPublicKeyValue(final String alias, final HsmInformation hsmInfo) {
+        final KeyPairInfo keyPair = hsmInfo.getKeyPair(alias);
+        final LongRef pubKey = keyPair != null ? keyPair.getPubKey() : getPublicKeyRef(alias, hsmInfo);
+        final byte[] value = getAttribute(pubKey, CKA.VALUE, hsmInfo, "public key value of " + alias);
+        if (value.length == 32) {
+            return value;
+        }
+        // Some libraries return the point wrapped in a DER OCTET STRING
+        if (value.length == 34 && value[0] == 0x04 && value[1] == 32) {
+            final byte[] raw = new byte[32];
+            System.arraycopy(value, 2, raw, 0, 32);
+            return raw;
+        }
+        throw new EJBException("Unexpected Ed25519 public key length " + value.length + " for alias: " + alias);
+    }
 
+    /** Reads one attribute of an object, checking every PKCS#11 return code. */
+    private static byte[] getAttribute(final LongRef object, final long type, final HsmInformation hsmInfo, final String what) {
+        LongRef sessionRef = null;
+        try {
+            sessionRef = hsmInfo.getSession();
+            final CKA[] templ = new CKA[] { new CKA(type) };
+            check(C.GetAttributeValue(sessionRef.value(), object.value(), templ), "C_GetAttributeValue(" + what + ")");
+            if (templ[0].ulValueLen < 0) {
+                throw new CKRException("Attribute not available: " + what, CKR.ATTRIBUTE_TYPE_INVALID);
+            }
+            templ[0].pValue = new byte[(int) templ[0].ulValueLen];
+            check(C.GetAttributeValue(sessionRef.value(), object.value(), templ), "C_GetAttributeValue(" + what + ")");
+            final byte[] value = templ[0].getValue();
+            if (value == null) {
+                throw new CKRException("No value returned for " + what, CKR.GENERAL_ERROR);
+            }
+            return value;
+        } catch (CKRException rv) {
+            hsmInfo.CloseSession(sessionRef);
+            sessionRef = null;
+            throw new EJBException("Couldn't read " + what + ": " + CKR.L2S(rv.getCKR()), rv);
         } finally {
             if (sessionRef != null) {
-                try {
-                    HsmInformation hsmInfo = hsmInfoCache.get(providerName);
-                    hsmInfo.releaseSession(sessionRef);
-                    log.debug("Released HSM session after sign/verify for alias: " + alias);
-                } catch (Exception ex) {
-                    log.warn("Failed to release HSM session for alias: " + alias, ex);
-                }
+                hsmInfo.releaseSession(sessionRef);
             }
         }
     }
@@ -341,46 +379,58 @@ public class Ed25519 {
      */
 
     public byte[] sign(String alias, byte[] data, String providerName){
-        LongRef sessionRef = null;
-        HsmInformation hsmInfo = null;
+        final HsmInformation hsmInfo = hsmInfoCache.get(providerName);
+        // Defensive null check - this method only works with HSM providers
+        if (hsmInfo == null) {
+            throw new IllegalStateException(
+                "HSM provider not initialized. The sign() method only works with HSM providers (e.g., Utimaco). " +
+                "Provider '" + providerName + "' is not an HSM provider or has not been initialized via updateHsmInfoCache(). " +
+                "Please ensure the HSM is properly configured and initialized before calling this method."
+            );
+        }
+        final long generation = hsmInfo.getGeneration();
         try {
-            hsmInfo = hsmInfoCache.get(providerName);
+            return signOnce(alias, data, hsmInfo);
+        } catch (RuntimeException e) {
+            // After an HSM connection loss the sessions can be left in an error state that only closing them clears
+            // (e.g. Utimaco R2: B90C0008 "session must be closed", reported as CKR_DEVICE_ERROR).
+            // Re-open the sessions, log in again and retry once.
+            log.warn("Signing with alias " + alias + " failed (" + e.getMessage() + "). Re-opening HSM sessions and retrying.");
+            hsmInfo.resetIfGeneration(generation);
+            return signOnce(alias, data, hsmInfo);
+        }
+    }
 
-            // Defensive null check - this method only works with HSM providers
-            if (hsmInfo == null) {
-                throw new IllegalStateException(
-                    "HSM provider not initialized. The sign() method only works with HSM providers (e.g., Utimaco). " +
-                    "Provider '" + providerName + "' is not an HSM provider or has not been initialized via updateHsmInfoCache(). " +
-                    "Please ensure the HSM is properly configured and initialized before calling this method."
-                );
-            }
-
+    private byte[] signOnce(final String alias, final byte[] data, final HsmInformation hsmInfo) {
+        if (!hsmInfo.KeyPairCache.containsKey(alias)) {
+            updateKeypairCache(alias, hsmInfo);
+        }
+        final LongRef privKey = hsmInfo.KeyPairCache.get(alias).getPrivKey();
+        LongRef sessionRef = null;
+        try {
             sessionRef = hsmInfo.getSession();
-
-            if(!hsmInfo.KeyPairCache.containsKey(alias)){
-                updateKeypairCache(alias, hsmInfo);
-            }
-
-            LongRef privKey = hsmInfo.KeyPairCache.get(alias).getPrivKey();
-
-            // since the algorythm is Ed25519 there's no need to create a digest.
-            C.SignInit(sessionRef.value(), new CKM(CKM.ECDSA), privKey.value());
-
-            LongRef length = new LongRef();
-            C.Sign(sessionRef.value(), data, null, length);
+            // since the algorithm is Ed25519 there's no need to create a digest.
+            check(C.SignInit(sessionRef.value(), new CKM(CKM.ECDSA), privKey.value()), "C_SignInit(" + alias + ")");
+            final LongRef length = new LongRef();
+            check(C.Sign(sessionRef.value(), data, null, length), "C_Sign(" + alias + ")");
             byte[] result = new byte[(int) length.value()];
-            C.Sign(sessionRef.value(), data, result, length);
-
-            return result;
-
-        }catch (CKRException rv) {
-                hsmInfo.CloseSession(sessionRef);
-            throw new EJBException("Couldn't sign data", rv);
-        }finally{
-            if(sessionRef != null){
-                hsmInfo.releaseSession(sessionRef);
+            check(C.Sign(sessionRef.value(), data, result, length), "C_Sign(" + alias + ")");
+            if (length.value() <= 0) {
+                throw new CKRException("Empty signature returned for alias " + alias, CKR.GENERAL_ERROR);
+            }
+            if (length.value() < result.length) {
+                result = resize(result, (int) length.value());
             }
             log.info("Signed data with: " + alias);
+            return result;
+        } catch (CKRException rv) {
+            hsmInfo.CloseSession(sessionRef);
+            sessionRef = null;
+            throw new EJBException("Couldn't sign data with alias " + alias + ": " + CKR.L2S(rv.getCKR()), rv);
+        } finally {
+            if (sessionRef != null) {
+                hsmInfo.releaseSession(sessionRef);
+            }
         }
     }
 
@@ -437,21 +487,9 @@ public class Ed25519 {
     public static synchronized HsmInformation updateHsmInfoCache(String providerName, String tokenName, String slotLabel, String authCode, String sharedLibrary){
         if(hsmInfoCache.containsKey(providerName)){
             HsmInformation hsmInf = hsmInfoCache.get(providerName);
-            if(!(hsmInf.authcode.equals(authCode))){
-                C.CloseSession(hsmInf.getSession().value());
-                hsmInf.setAuthCode(authCode);
-
-                LongRef sessionRef = new LongRef();
-
-                C.NATIVE = new org.pkcs11.jacknji11.jna.JNA(sharedLibrary);
-                C.Initialize();
-
-                C.OpenSession(Long.parseLong(slotLabel), CK_SESSION_INFO.CKF_RW_SESSION | CK_SESSION_INFO.CKF_SERIAL_SESSION, null, null, sessionRef);
-                C.Login(sessionRef.value, CKU.USER, authCode.getBytes());
-
-                hsmInf.releaseSession(sessionRef);
-
-            }
+            // (Re)activation always discards the cached sessions and key handles, opens a new session and logs in again.
+            // Re-using the cached sessions made activation fail after an HSM connection loss.
+            hsmInf.reset(authCode);
             if(!hsmInf.tokenName.contains(tokenName)){
                 hsmInf.addTokenName(tokenName);
             }
@@ -464,8 +502,12 @@ public class Ed25519 {
             C.NATIVE = new org.pkcs11.jacknji11.jna.JNA(sharedLibrary);
             C.Initialize();
 
-            C.OpenSession(Long.parseLong(slotLabel), CK_SESSION_INFO.CKF_RW_SESSION | CK_SESSION_INFO.CKF_SERIAL_SESSION, null, null, sessionRef);
-            C.Login(sessionRef.value, CKU.USER, authCode.getBytes());
+            check(C.OpenSession(Long.parseLong(slotLabel), CK_SESSION_INFO.CKF_RW_SESSION | CK_SESSION_INFO.CKF_SERIAL_SESSION, null, null, sessionRef), "C_OpenSession");
+            final long loginRv = C.Login(sessionRef.value, CKU.USER, authCode.getBytes());
+            if (loginRv != CKR.OK && loginRv != CKR.USER_ALREADY_LOGGED_IN) {
+                C.CloseSession(sessionRef.value);
+                check(loginRv, "C_Login");
+            }
 
             HsmInformation inf = new HsmInformation(authCode, slotLabel, tokenName, sessionRef, sharedLibrary);
             hsmInfoCache.put(providerName, inf);
@@ -542,9 +584,9 @@ public class Ed25519 {
             LongRef objectCount = new LongRef();
             long[] result = new long[1];
             CKA[] templ = new CKA[] {new CKA(CKA.LABEL, alias + "-private" )};
-            C.FindObjectsInit(sessionRef.value(), templ);
-            C.FindObjects(sessionRef.value(), result, objectCount);
-            C.FindObjectsFinal(sessionRef.value());
+            check(C.FindObjectsInit(sessionRef.value(), templ), "C_FindObjectsInit");
+            check(C.FindObjects(sessionRef.value(), result, objectCount), "C_FindObjects");
+            check(C.FindObjectsFinal(sessionRef.value()), "C_FindObjectsFinal");
 
             if (result[0] == 0) {
                 throw new EJBException("Private key error for alias: " + alias);
@@ -579,9 +621,9 @@ public class Ed25519 {
             LongRef objectCount = new LongRef();
             long[] result = new long[1];
             CKA[] templ = new CKA[] {new CKA(CKA.LABEL, alias)};
-            C.FindObjectsInit(sessionRef.value(), templ);
-            C.FindObjects(sessionRef.value(), result, objectCount);
-            C.FindObjectsFinal(sessionRef.value());
+            check(C.FindObjectsInit(sessionRef.value(), templ), "C_FindObjectsInit");
+            check(C.FindObjects(sessionRef.value(), result, objectCount), "C_FindObjects");
+            check(C.FindObjectsFinal(sessionRef.value()), "C_FindObjectsFinal");
 
             LongRef certificate = new LongRef(result[0]);
 
@@ -613,13 +655,16 @@ public class Ed25519 {
                 new CKA(CKA.ID),
             };
 
-            C.GetAttributeValue(sessionRef.value(), pubKey.value(), templ);
+            check(C.GetAttributeValue(sessionRef.value(), pubKey.value(), templ), "C_GetAttributeValue");
             // allocate memory and call again
             for (int i = 0; i < templ.length; i++){
                 templ[i].pValue = new byte[(int) templ[i].ulValueLen];
             }
-            C.GetAttributeValue(sessionRef.value(), pubKey.value(), templ);
+            check(C.GetAttributeValue(sessionRef.value(), pubKey.value(), templ), "C_GetAttributeValue");
             final CKA id = templ[0];
+            if (id.getValue() == null) {
+                throw new CKRException("No value returned for key " + pubKey.value(), CKR.GENERAL_ERROR);
+            }
 
             return id.getValueStr();
 
@@ -649,9 +694,9 @@ public class Ed25519 {
             LongRef objectCount = new LongRef();
             long[] result = new long[1];
             CKA[] templ = new CKA[] {new CKA(CKA.LABEL, alias + "-public")};
-            C.FindObjectsInit(sessionRef.value(), templ);
-            C.FindObjects(sessionRef.value(), result, objectCount);
-            C.FindObjectsFinal(sessionRef.value());
+            check(C.FindObjectsInit(sessionRef.value(), templ), "C_FindObjectsInit");
+            check(C.FindObjects(sessionRef.value(), result, objectCount), "C_FindObjects");
+            check(C.FindObjectsFinal(sessionRef.value()), "C_FindObjectsFinal");
 
             if (result[0] == 0) {
                 throw new EJBException("Public key error for alias: " + alias);
@@ -688,14 +733,17 @@ public class Ed25519 {
                 new CKA(CKA.KEY_TYPE),
             };
 
-            C.GetAttributeValue(sessionRef.value(), pubKey.value(), templ);
+            check(C.GetAttributeValue(sessionRef.value(), pubKey.value(), templ), "C_GetAttributeValue");
             // allocate memory and call again
             for (int i = 0; i < templ.length; i++){
                 templ[i].pValue = new byte[(int) templ[i].ulValueLen];
             }
-            C.GetAttributeValue(sessionRef.value(), pubKey.value(), templ);
+            check(C.GetAttributeValue(sessionRef.value(), pubKey.value(), templ), "C_GetAttributeValue");
 
             final CKA algo = templ[0];
+            if (algo.getValue() == null) {
+                throw new CKRException("No value returned for key " + pubKey.value(), CKR.GENERAL_ERROR);
+            }
 
             return CKK.L2S(algo.getValueLong());
 
@@ -726,15 +774,18 @@ public class Ed25519 {
                 new CKA(CKA.EC_PARAMS),
             };
 
-            C.GetAttributeValue(sessionRef.value(), pubKey.value(), templ);
+            check(C.GetAttributeValue(sessionRef.value(), pubKey.value(), templ), "C_GetAttributeValue");
             // allocate memory and call again
             for (int i = 0; i < templ.length; i++){
                 templ[i].pValue = new byte[(int) templ[i].ulValueLen];
             }
             //templ[0].pValue = new byte[(int) templ[0].ulValueLen];
-            C.GetAttributeValue(sessionRef.value(), pubKey.value(), templ);
+            check(C.GetAttributeValue(sessionRef.value(), pubKey.value(), templ), "C_GetAttributeValue");
 
             final CKA params = templ[0];
+            if (params.getValue() == null) {
+                throw new CKRException("No value returned for key " + pubKey.value(), CKR.GENERAL_ERROR);
+            }
 
             return params.getValueStr();
         }catch (CKRException rv) {
@@ -892,6 +943,8 @@ public class Ed25519 {
         private final LinkedList<LongRef> activeSessions = new LinkedList<>();
         private String sharedLibrary;
         private HashMap<String,KeyPairInfo> KeyPairCache;
+        private volatile long generation = 0;
+        private final java.util.Set<LongRef> retiredSessions = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
 
 
         public HsmInformation (String authcode, String slot, String tokenName, LongRef sessionRef, String sharedLibrary){
@@ -906,20 +959,26 @@ public class Ed25519 {
         }
 
         public synchronized void releaseSession(LongRef sessionRef){
-            if(activeSessions.contains(sessionRef)){
-                activeSessions.remove(sessionRef);
-            }else{
-                log.warn("Session not active: " + sessionRef);
+            if (sessionRef == null) {
+                return;
             }
-
-            idleSessions.push(sessionRef);
+            // Only sessions that are still in use go back to the pool. Sessions that were closed or discarded
+            // (after an error or a reset) must never be handed out again.
+            if (activeSessions.remove(sessionRef)) {
+                idleSessions.push(sessionRef);
+            } else if (retiredSessions.remove(sessionRef)) {
+                // Discarded by reset() while this thread was still using it; now it is safe to close it
+                closeQuietly(java.util.Collections.singletonList(sessionRef));
+            } else if (log.isDebugEnabled()) {
+                log.debug("Not returning closed or discarded session to the pool: " + sessionRef.value());
+            }
         }
 
         public synchronized LongRef getSession(){
-            LongRef sessionRef = new LongRef();
+            LongRef sessionRef;
             if(idleSessions.size() == 0){
                 try{
-                    C.OpenSession(Long.parseLong(this.slot), CK_SESSION_INFO.CKF_RW_SESSION | CK_SESSION_INFO.CKF_SERIAL_SESSION, null, null, sessionRef);
+                    sessionRef = openSession();
                     if(log.isDebugEnabled()){
                         log.debug("iddleSessions is empty, adding new session: " + sessionRef.value());
                     }
@@ -936,28 +995,92 @@ public class Ed25519 {
             return sessionRef;
         }
 
+        private LongRef openSession() {
+            final LongRef sessionRef = new LongRef();
+            check(C.OpenSession(Long.parseLong(this.slot), CK_SESSION_INFO.CKF_RW_SESSION | CK_SESSION_INFO.CKF_SERIAL_SESSION, null, null, sessionRef), "C_OpenSession");
+            return sessionRef;
+        }
+
+        public long getGeneration() {
+            return generation;
+        }
+
+        /** Resets the sessions unless another thread already did so since {@code expectedGeneration} was read. */
+        public synchronized void resetIfGeneration(final long expectedGeneration) {
+            if (generation == expectedGeneration) {
+                reset(null);
+            } else if (log.isDebugEnabled()) {
+                log.debug("HSM sessions for slot " + slot + " were already re-opened by another thread.");
+            }
+        }
+
+        /**
+         * Discards all sessions and cached key handles, opens a new session and logs in again.
+         * This is what deactivating and re-activating the crypto token used to achieve manually.
+         */
+        public synchronized void reset(final String newAuthcode) {
+            generation++;
+            if (newAuthcode != null) {
+                this.authcode = newAuthcode;
+            }
+            // Idle sessions are closed below. Sessions still in use by other threads must NOT be closed now:
+            // closing a session while another thread is inside a PKCS#11 call on it crashes the Utimaco R2
+            // library (SIGSEGV). They are closed when their thread releases them.
+            final List<LongRef> oldSessions = new ArrayList<>(idleSessions);
+            final int inUse = activeSessions.size();
+            retiredSessions.addAll(activeSessions);
+            idleSessions.clear();
+            activeSessions.clear();
+            KeyPairCache.clear();
+            // Open and log in a new session before closing the old ones, so the token is never left without a session
+            final LongRef sessionRef;
+            try {
+                sessionRef = openSession();
+            } catch (CKRException rv) {
+                closeQuietly(oldSessions);
+                throw new EJBException("Couldn't open a new HSM session for slot " + slot + ": " + CKR.L2S(rv.getCKR()), rv);
+            }
+            final long rv = C.Login(sessionRef.value(), CKU.USER, authcode.getBytes());
+            if (rv != CKR.OK && rv != CKR.USER_ALREADY_LOGGED_IN) {
+                closeQuietly(oldSessions);
+                closeQuietly(java.util.Collections.singletonList(sessionRef));
+                throw new EJBException("Couldn't log in to the HSM slot " + slot + ": " + CKR.L2S(rv), new CKRException(rv));
+            }
+            idleSessions.push(sessionRef);
+            closeQuietly(oldSessions);
+            log.info("Re-opened HSM sessions for slot " + slot + " (" + oldSessions.size() + " idle session(s) closed, "
+                    + inUse + " in-use session(s) will be closed when released).");
+        }
+
+        private static void closeQuietly(final List<LongRef> sessions) {
+            for (final LongRef session : sessions) {
+                final long rv = C.CloseSession(session.value());
+                if (rv != CKR.OK && log.isDebugEnabled()) {
+                    log.debug("Ignoring " + CKR.L2S(rv) + " while closing HSM session " + session.value());
+                }
+            }
+        }
+
         // Closing the last session causes the user to be logged out. A new iddle session will be created in this case to prevent logout.
         public synchronized void CloseSession(LongRef sessionRef){
-            if(idleSessions.size() == 0 && activeSessions.size() <= 1){
-                releaseSession(getSession());
+            if (sessionRef == null) {
+                return;
             }
-
-            try {
-                C.CloseSession(sessionRef.value());
-            } catch (CKRException rv) {
-                throw new EJBException(rv);
+            activeSessions.remove(sessionRef);
+            idleSessions.remove(sessionRef);
+            retiredSessions.remove(sessionRef);
+            // Closing the last session logs the user out, so keep one session open
+            if (idleSessions.isEmpty() && activeSessions.isEmpty()) {
+                try {
+                    idleSessions.push(openSession());
+                } catch (CKRException rv) {
+                    log.warn("Couldn't open a replacement HSM session for slot " + slot + ": " + CKR.L2S(rv.getCKR()));
+                }
             }
-
-            if(activeSessions.contains(sessionRef)){
-                activeSessions.remove(sessionRef);
-            }else if(idleSessions.contains(sessionRef)){
-                idleSessions.remove(sessionRef);
-            }
-
+            final long rv = C.CloseSession(sessionRef.value());
             if(log.isDebugEnabled()){
-                log.debug("Closed Session: " + sessionRef.value());
+                log.debug("Closed Session: " + sessionRef.value() + (rv == CKR.OK ? "" : " (" + CKR.L2S(rv) + ")"));
             }
-
         }
 
         public void setAuthCode(String authcode) {
@@ -1052,15 +1175,15 @@ public class Ed25519 {
 
             CKA[] templ = new CKA[] {new CKA(CKA.CLASS, CKO.PUBLIC_KEY)};
 
-            C.FindObjectsInit(sessionRef.value(), templ);
-            C.FindObjects(sessionRef.value(), found, objectCount);
+            check(C.FindObjectsInit(sessionRef.value(), templ), "C_FindObjectsInit");
+            check(C.FindObjects(sessionRef.value(), found, objectCount), "C_FindObjects");
 
             long count = objectCount.value();
 
             long[] result = new long[(int) count];
             System.arraycopy(found, 0, result, 0, result.length);
 
-            C.FindObjectsFinal(sessionRef.value());
+            check(C.FindObjectsFinal(sessionRef.value()), "C_FindObjectsFinal");
 
             for(long ref : result){
                 LongRef tempRef = new LongRef(ref);
@@ -1069,17 +1192,20 @@ public class Ed25519 {
                     new CKA(CKA.LABEL),
                 };
 
-                C.GetAttributeValue(sessionRef.value(), tempRef.value(), templ2);
+                check(C.GetAttributeValue(sessionRef.value(), tempRef.value(), templ2), "C_GetAttributeValue(label)");
 
                 // allocate memory and call again
-                for (int i = 0; i < templ.length; i++){
+                for (int i = 0; i < templ2.length; i++){
                     templ2[i].pValue = new byte[(int) templ2[i].ulValueLen];
                 }
 
-                C.GetAttributeValue(sessionRef.value(), tempRef.value(), templ2);
+                check(C.GetAttributeValue(sessionRef.value(), tempRef.value(), templ2), "C_GetAttributeValue(label)");
 
                 final CKA label = templ2[0];
 
+                if (label.getValue() == null) {
+                    throw new CKRException("No label returned for object " + ref, CKR.GENERAL_ERROR);
+                }
                 String s = label.getValueStr();
                 String alias = s.substring(0, s.length() - 7);
 
